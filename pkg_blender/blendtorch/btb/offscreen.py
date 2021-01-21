@@ -1,6 +1,22 @@
 import numpy as np
 import bpy, gpu, bgl
-from OpenGL.GL import glGetTexImage
+import os, sys
+try:
+    import OpenGL as ogl
+    try:
+        from OpenGL.GL import glGetTexImage   # this fails in <=2020 versions of Python on OS X 11.x
+    except ImportError:
+        print('Drat, patching for Big Sur')
+        from ctypes import util
+        orig_util_find_library = util.find_library
+        def new_util_find_library( name ):
+            res = orig_util_find_library( name )
+            if res: return res
+            return '/System/Library/Frameworks/'+name+'.framework/'+name
+        util.find_library = new_util_find_library
+        from OpenGL.GL import glGetTexImage
+except ImportError:
+    pass
 
 from .signal import Signal
 from .camera import Camera
@@ -73,24 +89,48 @@ class OffScreenRenderer:
         image: HxWxD array
             where D is 4 when `mode=='RGBA'` else 3.
         '''
-        with self.offscreen.bind():
-            self.offscreen.draw_view3d(
-                bpy.context.scene,
-                bpy.context.view_layer,
-                self.space,  #bpy.context.space_data
-                self.region, #bpy.context.region
-                self.camera.view_matrix,
-                self.camera.proj_matrix)
-                                
-            bgl.glActiveTexture(bgl.GL_TEXTURE0)
-            bgl.glBindTexture(bgl.GL_TEXTURE_2D, self.offscreen.color_texture)   
+        print("Start render")
+        # switch on nodes
+        bpy.context.scene.use_nodes = True
+        tree = bpy.context.scene.node_tree
+        links = tree.links
+        
+        # clear default nodes
+        for n in tree.nodes:
+            tree.nodes.remove(n)
+        
+        # create input render layer node
+        rl = tree.nodes.new('CompositorNodeRLayers')      
+        rl.location = 185,285
+        
+        # create output node
+        v = tree.nodes.new('CompositorNodeViewer')   
+        v.location = 750,210
+        v.use_alpha = False
+        
+        # Links
+        links.new(rl.outputs[0], v.inputs[0])  # link Image output to Viewer input
+        logfile = 'blender_render.log'
+        open(logfile, 'a').close()
+        old = os.dup(1)
+        sys.stdout.flush()
+        os.close(1)
+        os.open(logfile, os.O_WRONLY)
 
-            # np.asarray seems slow, because bgl.buffer does not support the python buffer protocol
-            # bgl.glGetTexImage(bgl.GL_TEXTURE_2D, 0, bgl.GL_RGB, bgl.GL_UNSIGNED_BYTE, self.buffer)
-            # https://docs.blender.org/api/blender2.8/gpu.html       
-            # That's why we use PyOpenGL at this point instead.     
-            glGetTexImage(bgl.GL_TEXTURE_2D, 0, self.mode, bgl.GL_UNSIGNED_BYTE, self.buffer)
+        # render
+        bpy.context.scene.render.filepath = "~/render_eye"
+        bpy.ops.render.render(write_still=True)
 
+        os.close(1)
+        os.dup(old)
+        os.close(old)
+                
+        # get viewer pixels
+        pixels = bpy.data.images['Viewer Node'].pixels
+        print(len(pixels)) # size is always width * height * 4 (rgba)
+        
+        # copy buffer to numpy array for faster manipulation
+        self.buffer = np.array(pixels[:]).reshape(self.shape[0], self.shape[1], 4)[:,:,:3]
         buffer = self.buffer
         if self.origin == 'upper-left':
             buffer = np.flipud(buffer)
